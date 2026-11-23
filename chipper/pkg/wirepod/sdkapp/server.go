@@ -701,6 +701,8 @@ func BeginServer() {
 		PingerEnabled = false
 		logger.Println("Jdocs pinger has been disabled")
 	}
+	StartBasalMapFromDisk()
+	http.HandleFunc("/api-sdk/basal_map", handleBasalMap)
 	http.HandleFunc("/api-sdk/", SdkapiHandler)
 	http.HandleFunc("/delete_bot", func(w http.ResponseWriter, r *http.Request) {
 		if err := deleteBotViaSerial(r.FormValue("serial")); err != nil {
