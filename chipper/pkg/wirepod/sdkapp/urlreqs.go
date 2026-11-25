@@ -5,15 +5,26 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
+	"strings"
+	"time"
 )
 
 var transCfg = &http.Transport{
 	TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 }
 
-func updateSettings(robot *Robot, settings map[string]interface{}) error {
+var sdkSettingsClient = &http.Client{
+	Transport: transCfg,
+	Timeout:   10 * time.Second,
+}
+
+func updateSettingsWithClient(client *http.Client, baseURL, guid string, settings map[string]interface{}) error {
+	if client == nil {
+		client = sdkSettingsClient
+	}
 	body, err := json.Marshal(map[string]interface{}{
 		"update_settings": true,
 		"settings":        settings,
@@ -21,19 +32,30 @@ func updateSettings(robot *Robot, settings map[string]interface{}) error {
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest("POST", "https://"+robot.Target+"/v1/update_settings", bytes.NewBuffer(body))
+	target := strings.TrimRight(baseURL, "/") + "/v1/update_settings"
+	req, err := http.NewRequest(http.MethodPost, target, bytes.NewBuffer(body))
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+robot.GUID)
+	req.Header.Set("Authorization", "Bearer "+guid)
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Transport: transCfg}
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("update_settings http %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
 	return nil
+}
+
+func updateSettings(robot *Robot, settings map[string]interface{}) error {
+	if robot == nil {
+		return fmt.Errorf("update_settings: nil robot")
+	}
+	return updateSettingsWithClient(sdkSettingsClient, "https://"+robot.Target, robot.GUID, settings)
 }
 
 func setCustomEyeColor(robot *Robot, hue string, sat string) error {

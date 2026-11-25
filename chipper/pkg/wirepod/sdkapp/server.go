@@ -75,13 +75,7 @@ func SdkapiHandler(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "success")
 		return
 	case r.URL.Path == "/api-sdk/cloud_intent":
-		intent := r.FormValue("intent")
-		robot.Conn.AppIntent(ctx,
-			&vectorpb.AppIntentRequest{
-				Intent: intent,
-			},
-		)
-		fmt.Fprintf(w, "done")
+		handleCloudIntent(w, r, robotObj)
 		return
 	case r.URL.Path == "/api-sdk/eye_color":
 		eye_color := r.FormValue("color")
@@ -133,45 +127,8 @@ func SdkapiHandler(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "done")
 		return
 	case r.URL.Path == "/api-sdk/get_sdk_settings":
-		i := 0
-		for {
-			resp, err := robot.Conn.PullJdocs(ctx, &vectorpb.PullJdocsRequest{
-				JdocTypes: []vectorpb.JdocType{vectorpb.JdocType_ROBOT_SETTINGS},
-			})
-			if err != nil {
-				w.Write([]byte(err.Error()))
-				return
-			}
-			if len(resp.NamedJdocs) == 0 || resp.NamedJdocs[0].Doc == nil {
-				w.Write([]byte("error: bot returned no jdocs"))
-				return
-			}
-			if strings.Contains(resp.NamedJdocs[0].Doc.JsonDoc, "BStat.ReactedToTriggerWord") {
-				time.Sleep(time.Second / 2)
-				if i > 3 {
-					logger.Println("Bot refuses to return RobotSettings jdoc...")
-					logger.Println("Returned Jdoc: ", resp.NamedJdocs[0].Doc.JsonDoc)
-					w.Write([]byte("error: bot refuses to return robotsettings"))
-					return
-				}
-				i = i + 1
-				continue
-			}
-			json := resp.NamedJdocs[0].Doc.JsonDoc
-			var ajdoc vars.AJdoc
-			ajdoc.DocVersion = resp.NamedJdocs[0].Doc.DocVersion
-			ajdoc.FmtVersion = resp.NamedJdocs[0].Doc.FmtVersion
-			ajdoc.JsonDoc = resp.NamedJdocs[0].Doc.JsonDoc
-			thing := "vic:" + robotObj.ESN
-			if old, ok := vars.GetJdoc(thing, "vic.RobotSettings"); !ok || old.DocVersion != ajdoc.DocVersion || old.JsonDoc != ajdoc.JsonDoc {
-				vars.AddJdoc(thing, "vic.RobotSettings", ajdoc)
-				logger.Println("Updating vic.RobotSettings (source: sdkapp)")
-			}
-			w.WriteHeader(http.StatusOK)
-			w.Header().Set("Content-Type", "application/octet-stream")
-			w.Write([]byte(json))
-			return
-		}
+		handleGetSDKSettings(w, r, robotObj)
+		return
 
 	case r.URL.Path == "/api-sdk/play_sound":
 		file, _, err := r.FormFile("sound")
@@ -289,27 +246,18 @@ func SdkapiHandler(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "done")
 		return
 	case r.URL.Path == "/api-sdk/assume_behavior_control":
+		if err := assumeBehaviorControlWait(r.Context(), robotObj, r.FormValue("priority"), bcGrantWaitTimeout); err != nil {
+			fmt.Fprint(w, "error: "+err.Error())
+			return
+		}
 		fmt.Fprintf(w, "success")
-		assumeBehaviorControl(robotObj, r.FormValue("priority"))
 		return
 	case r.URL.Path == "/api-sdk/release_behavior_control":
 		releaseBehaviorControl(robotObj)
 		fmt.Fprintf(w, "success")
 		return
 	case r.URL.Path == "/api-sdk/say_text":
-		if len([]rune(r.FormValue("text"))) >= 600 {
-			fmt.Fprint(w, "error: text is too long")
-			return
-		}
-		robot.Conn.SayText(
-			ctx,
-			&vectorpb.SayTextRequest{
-				DurationScalar: 1,
-				UseVectorVoice: true,
-				Text:           r.FormValue("text"),
-			},
-		)
-		fmt.Fprintf(w, "success")
+		handleSayText(w, r, robotObj)
 		return
 	case r.URL.Path == "/api-sdk/move_wheels":
 		lw, _ := strconv.Atoi(r.FormValue("lw"))
@@ -524,20 +472,7 @@ func SdkapiHandler(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "done")
 		return
 	case r.URL.Path == "/api-sdk/get_robot_stats":
-		resp, err := robot.Conn.PullJdocs(ctx,
-			&vectorpb.PullJdocsRequest{
-				JdocTypes: []vectorpb.JdocType{vectorpb.JdocType_ROBOT_LIFETIME_STATS},
-			})
-		if err != nil {
-			fmt.Fprint(w, "error: "+err.Error())
-			return
-		}
-		jdocs := resp.GetNamedJdocs()
-		if len(jdocs) == 0 {
-			fmt.Fprint(w, "error: bot returned no jdocs")
-			return
-		}
-		w.Write([]byte(jdocs[0].GetDoc().GetJsonDoc()))
+		handleGetRobotStats(w, r, robotObj)
 		return
 	case r.URL.Path == "/api-sdk/print_robot_info":
 		fmt.Fprint(w, robot)
@@ -798,4 +733,149 @@ func resizeImage(original image.Image, width, height int) image.Image {
 	}
 
 	return newImage
+}
+
+const (
+	sayTextTimeout     = 15 * time.Second
+	cloudIntentTimeout = 10 * time.Second
+	pullJdocTimeout    = 10 * time.Second
+)
+
+func handleSayText(w http.ResponseWriter, r *http.Request, robotObj *Robot) {
+	if robotObj == nil || robotObj.Vector == nil {
+		fmt.Fprint(w, "error: no active robot connection")
+		return
+	}
+	handleSayTextWithFn(w, r, robotObj.Ctx, func(sctx context.Context, req *vectorpb.SayTextRequest) (*vectorpb.SayTextResponse, error) {
+		return robotObj.Vector.Conn.SayText(sctx, req)
+	})
+}
+
+func handleSayTextWithFn(w http.ResponseWriter, r *http.Request, baseCtx context.Context,
+	sayFn func(context.Context, *vectorpb.SayTextRequest) (*vectorpb.SayTextResponse, error)) {
+	text := strings.TrimSpace(r.FormValue("text"))
+	if text == "" {
+		fmt.Fprint(w, "error: text is required")
+		return
+	}
+	if len([]rune(text)) >= 600 {
+		fmt.Fprint(w, "error: text is too long")
+		return
+	}
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	sayCtx, cancel := context.WithTimeout(baseCtx, sayTextTimeout)
+	defer cancel()
+	resp, err := sayFn(sayCtx, &vectorpb.SayTextRequest{
+		DurationScalar: 1,
+		UseVectorVoice: true,
+		Text:           text,
+	})
+	if err != nil {
+		fmt.Fprint(w, "error: "+err.Error())
+		return
+	}
+	if resp != nil && resp.GetState() == vectorpb.SayTextResponse_INVALID {
+		fmt.Fprint(w, "error: say_text rejected by robot")
+		return
+	}
+	fmt.Fprintf(w, "success")
+}
+
+func handleCloudIntent(w http.ResponseWriter, r *http.Request, robotObj *Robot) {
+	if robotObj == nil || robotObj.Vector == nil {
+		fmt.Fprint(w, "error: no active robot connection")
+		return
+	}
+	handleCloudIntentWithFn(w, r, robotObj.Ctx, func(ictx context.Context, req *vectorpb.AppIntentRequest) (*vectorpb.AppIntentResponse, error) {
+		return robotObj.Vector.Conn.AppIntent(ictx, req)
+	})
+}
+
+func handleCloudIntentWithFn(w http.ResponseWriter, r *http.Request, baseCtx context.Context,
+	intentFn func(context.Context, *vectorpb.AppIntentRequest) (*vectorpb.AppIntentResponse, error)) {
+	intent := r.FormValue("intent")
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	ictx, cancel := context.WithTimeout(baseCtx, cloudIntentTimeout)
+	defer cancel()
+	if _, err := intentFn(ictx, &vectorpb.AppIntentRequest{Intent: intent}); err != nil {
+		fmt.Fprint(w, "error: "+err.Error())
+		return
+	}
+	fmt.Fprintf(w, "done")
+}
+
+func pullOneJdoc(parent context.Context, conn vectorpb.ExternalInterfaceClient, jtype vectorpb.JdocType) (*vectorpb.NamedJdoc, error) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	jctx, cancel := context.WithTimeout(parent, pullJdocTimeout)
+	defer cancel()
+	resp, err := conn.PullJdocs(jctx, &vectorpb.PullJdocsRequest{JdocTypes: []vectorpb.JdocType{jtype}})
+	if err != nil {
+		return nil, err
+	}
+	jdocs := resp.GetNamedJdocs()
+	if len(jdocs) == 0 || jdocs[0] == nil || jdocs[0].GetDoc() == nil {
+		return nil, fmt.Errorf("bot returned no jdocs")
+	}
+	return jdocs[0], nil
+}
+
+func handleGetSDKSettings(w http.ResponseWriter, r *http.Request, robotObj *Robot) {
+	if robotObj == nil || robotObj.Vector == nil {
+		fmt.Fprint(w, "error: no active robot connection")
+		return
+	}
+	for i := 0; i < 5; i++ {
+		named, err := pullOneJdoc(r.Context(), robotObj.Vector.Conn, vectorpb.JdocType_ROBOT_SETTINGS)
+		if err != nil {
+			fmt.Fprint(w, "error: "+err.Error())
+			return
+		}
+		doc := named.GetDoc()
+		if strings.Contains(doc.GetJsonDoc(), "BStat.ReactedToTriggerWord") {
+			if i >= 4 {
+				logger.Println("Bot refuses to return RobotSettings jdoc...")
+				logger.Println("Returned Jdoc: ", doc.GetJsonDoc())
+				w.Write([]byte("error: bot refuses to return robotsettings"))
+				return
+			}
+			time.Sleep(time.Second / 2)
+			continue
+		}
+		saveSettingsJdoc(robotObj.ESN, doc)
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(doc.GetJsonDoc()))
+		return
+	}
+}
+
+func saveSettingsJdoc(esn string, doc *vectorpb.Jdoc) {
+	var ajdoc vars.AJdoc
+	ajdoc.DocVersion = doc.GetDocVersion()
+	ajdoc.FmtVersion = doc.GetFmtVersion()
+	ajdoc.JsonDoc = doc.GetJsonDoc()
+	thing := "vic:" + esn
+	if old, ok := vars.GetJdoc(thing, "vic.RobotSettings"); !ok || old.DocVersion != ajdoc.DocVersion || old.JsonDoc != ajdoc.JsonDoc {
+		vars.AddJdoc(thing, "vic.RobotSettings", ajdoc)
+		logger.Println("Updating vic.RobotSettings (source: sdkapp)")
+	}
+}
+
+func handleGetRobotStats(w http.ResponseWriter, r *http.Request, robotObj *Robot) {
+	if robotObj == nil || robotObj.Vector == nil {
+		fmt.Fprint(w, "error: no active robot connection")
+		return
+	}
+	named, err := pullOneJdoc(r.Context(), robotObj.Vector.Conn, vectorpb.JdocType_ROBOT_LIFETIME_STATS)
+	if err != nil {
+		fmt.Fprint(w, "error: "+err.Error())
+		return
+	}
+	w.Write([]byte(named.GetDoc().GetJsonDoc()))
 }
